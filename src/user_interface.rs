@@ -1,3 +1,5 @@
+use wgpu::util::DeviceExt;
+
 use crate::rendering;
 use crate::rendering::renderable::Vertex;
 use crate::sprite;
@@ -25,9 +27,14 @@ fn init_render_pipeline(gpu: rendering::GpuHandle) -> wgpu::RenderPipeline {
                 &gpu.device()
                     .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                         label: Some("user interface render pipeline layout"),
-                        bind_group_layouts: &[&gpu.device().create_bind_group_layout(
-                            &sprite::GpuTexture::BIND_GROUP_LAYOUT_DESCRIPTOR,
-                        )],
+                        bind_group_layouts: &[
+                            &gpu.device().create_bind_group_layout(
+                                &sprite::GpuTexture::BIND_GROUP_LAYOUT_DESCRIPTOR,
+                            ),
+                            &gpu.device().create_bind_group_layout(
+                                &UserInterfaceProjectionMatrix::BIND_GROUP_LAYOUT_DESCRIPTOR,
+                            ),
+                        ],
                         push_constant_ranges: &[],
                     }),
             ),
@@ -98,15 +105,22 @@ impl<'window> UserInterface<'window> {
         for (id, image_delta) in textures_delta.set {
             log::info!("Writing texture: {id:?}");
             self.renderer.write_texture(&id, image_delta);
+            log::info!("Finished writing texture: {id:?}");
         }
 
-        dbg!();
         let data = self
             .context
             .tessellate(shapes, pixels_per_point)
             .into_iter()
             .map(UserInterfaceRenderable::from)
             .collect::<Vec<_>>();
+        let gpu = self.renderer.gpu_handle.read().unwrap();
+        let surface_config = gpu.surface_config();
+        self.renderer.projection_matrix.update(glam::vec2(
+            (surface_config.width as f32).recip(),
+            (surface_config.height as f32).recip(),
+        ));
+        drop(gpu);
         self.renderer.render(&data);
         for id in textures_delta.free {
             self.renderer.textures.remove(&id);
@@ -119,6 +133,7 @@ pub struct UserInterfaceRenderer<'window> {
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     textures: collections::HashMap<egui::TextureId, sync::Arc<sprite::GpuTexture>>,
+    projection_matrix: UserInterfaceProjectionMatrix<'window>,
 }
 
 impl<'window> UserInterfaceRenderer<'window> {
@@ -127,25 +142,22 @@ impl<'window> UserInterfaceRenderer<'window> {
         let vertex_buffer = gpu.device().create_buffer(&wgpu::BufferDescriptor {
             label: Some("User Interface Vertex Buffer"),
             size: 100000,
-            usage: wgpu::BufferUsages::VERTEX
-                | wgpu::BufferUsages::MAP_WRITE
-                | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let index_buffer = gpu.device().create_buffer(&wgpu::BufferDescriptor {
-            label: Some("User Interface Vertex Buffer"),
+            label: Some("User Interface Index Buffer"),
             size: 100000,
-            usage: wgpu::BufferUsages::INDEX
-                | wgpu::BufferUsages::MAP_WRITE
-                | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         drop(gpu);
         Self {
-            gpu_handle,
+            gpu_handle: gpu_handle.clone(),
             vertex_buffer,
             index_buffer,
             textures: collections::HashMap::new(),
+            projection_matrix: UserInterfaceProjectionMatrix::new(gpu_handle.clone()),
         }
     }
     fn write_texture(&mut self, id: &egui::TextureId, image_delta: egui::epaint::ImageDelta) {
@@ -251,7 +263,7 @@ impl<'window> UserInterfaceRenderer<'window> {
             RENDER_PIPLINE.get_or_init(|| init_render_pipeline(self.gpu_handle.clone())),
         );
         let mut gpu = self.gpu_handle.write().unwrap();
-        let verticies = data
+        let vertices = data
             .iter()
             .flat_map(|renderable| bytemuck::cast_slice(&renderable.verticies))
             .copied()
@@ -263,12 +275,22 @@ impl<'window> UserInterfaceRenderer<'window> {
             .copied()
             .collect::<Vec<u8>>();
 
-        dbg!(indices.len() / 3);
-        gpu.queue().write_buffer(&self.vertex_buffer, 0, &verticies);
-        gpu.queue().write_buffer(&self.index_buffer, 0, &indices);
+        gpu.write_buffer(
+            &self.vertex_buffer,
+            0,
+            std::num::NonZero::new(vertices.len() as u64).unwrap(),
+        )
+        .copy_from_slice(&vertices);
+        gpu.write_buffer(
+            &self.index_buffer,
+            0,
+            std::num::NonZero::new(indices.len() as u64).unwrap(),
+        )
+        .copy_from_slice(&indices);
 
         render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
         render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+        render_pass.set_bind_group(1, &self.projection_matrix.bind_group, &[]);
 
         let mut base_vertex = 0;
         for renderable in data {
@@ -288,7 +310,6 @@ impl<'window> UserInterfaceRenderer<'window> {
                 &[],
             );
 
-            // render_pass.set_bind_group(0, bind_group, offsets);
             render_pass.draw_indexed(0..renderable.indicies.len() as u32, base_vertex, 0..1);
 
             base_vertex += renderable.indicies.len() as i32;
@@ -363,4 +384,66 @@ impl Vertex for ColoredVertex {
             shader_location: 2,
         },
     ];
+}
+
+struct UserInterfaceProjectionMatrix<'window> {
+    gpu_handle: rendering::GpuHandle<'window>,
+    matrix: glam::Mat4,
+    bind_group: wgpu::BindGroup,
+    buffer: wgpu::Buffer,
+}
+impl<'a, 'window> UserInterfaceProjectionMatrix<'window> {
+    const BIND_GROUP_LAYOUT_DESCRIPTOR: wgpu::BindGroupLayoutDescriptor<'a> =
+        wgpu::BindGroupLayoutDescriptor {
+            label: Some("user interface projection matrix bind group layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        };
+    pub fn new(gpu_handle: rendering::GpuHandle<'window>) -> Self {
+        let gpu = gpu_handle.read().unwrap();
+        let matrix = glam::Mat4::IDENTITY;
+        let buffer = gpu
+            .device()
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("User interface projection matrix buffer"),
+                contents: bytemuck::cast_slice(&[matrix]),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            });
+        let bind_group = gpu.device().create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("User interface projection matrix bind group"),
+            layout: &gpu
+                .device()
+                .create_bind_group_layout(&Self::BIND_GROUP_LAYOUT_DESCRIPTOR),
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &buffer,
+                    offset: 0,
+                    size: None,
+                }),
+            }],
+        });
+        Self {
+            gpu_handle: gpu_handle.clone(),
+            matrix,
+            bind_group,
+            buffer,
+        }
+    }
+    pub fn update(&mut self, new_scale: glam::Vec2) {
+        let gpu = self.gpu_handle.read().unwrap();
+        self.matrix = glam::Mat4::IDENTITY;
+        // glam::Mat4::from_translation(glam::Vec3::new(-1.0, -1.0, 0.0))
+        // * glam::Mat4::from_scale(glam::Vec3::new(new_scale.x, new_scale.y, 1.0));
+        gpu.queue()
+            .write_buffer(&self.buffer, 0, bytemuck::cast_slice(&[self.matrix]));
+    }
 }

@@ -10,11 +10,14 @@ struct VertexOutput {
     @location(1) color: vec4<f32>,
 }
 
+@group(1) @binding(0)
+var<uniform> projection_matrix: mat4x4<f32>;
+
 @vertex
 fn vertex_main(input: VertexInput) -> VertexOutput {
     var output: VertexOutput;
     output.uv = input.uv;
-    output.clip_position = vec4<f32>(input.position,1.0, 1.0);
+    output.clip_position = projection_matrix * vec4<f32>(input.position, 0.0, 0.0);
     output.color = input.color;
     return output;
 }

@@ -1,5 +1,4 @@
 use std::sync;
-use winit::platform::wayland::EventLoopBuilderExtWayland;
 use winit::window;
 
 pub mod rendering;
@@ -9,9 +8,7 @@ pub mod user_interface;
 
 pub fn start() -> Result<(), anyhow::Error> {
     let mut app = App::new();
-    let event_loop = winit::event_loop::EventLoop::builder()
-        .with_wayland()
-        .build()?;
+    let event_loop = winit::event_loop::EventLoop::builder().build()?;
 
     event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
     event_loop.run_app(&mut app)?;
@@ -74,7 +71,7 @@ impl winit::application::ApplicationHandler for App<'_> {
                         egui::vec2(physical_size.width as f32, physical_size.height as f32),
                     ));
             }
-            WindowEvent::Moved(physical_position) => todo!(),
+            WindowEvent::Moved(physical_position) => (),
             WindowEvent::CloseRequested => todo!(),
             WindowEvent::Destroyed => todo!(),
             WindowEvent::DroppedFile(path_buf) => todo!(),
@@ -202,9 +199,7 @@ impl winit::application::ApplicationHandler for App<'_> {
             WindowEvent::ScaleFactorChanged {
                 scale_factor,
                 inner_size_writer,
-            } => {
-                dbg!(scale_factor);
-            }
+            } => (),
             WindowEvent::ThemeChanged(theme) => todo!(),
             WindowEvent::Occluded(_) => todo!(),
         }

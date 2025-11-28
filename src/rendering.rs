@@ -5,13 +5,15 @@ use std::sync;
 pub mod buffer;
 pub mod renderable;
 
-const SHADER: &[u8] = include_bytes!("shader.wgsl");
+// const SHADER: &[u8] = include_bytes!("shader.wgsl");
 
 pub type GpuHandle<'window> = sync::Arc<sync::RwLock<Gpu<'window>>>;
 
 pub struct Gpu<'window> {
     device: wgpu::Device,
     queue: wgpu::Queue,
+    belt: wgpu::util::StagingBelt,
+    belt_encoder: wgpu::CommandEncoder,
     surface: wgpu::Surface<'window>,
     surface_config: wgpu::SurfaceConfiguration,
     output: Option<wgpu::SurfaceTexture>,
@@ -56,18 +58,24 @@ impl<'window> Gpu<'window> {
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("device"),
-                required_features: adapter.features(),
+                required_features: wgpu::Features::empty(),
                 required_limits: wgpu::Limits::default(),
                 memory_hints: wgpu::MemoryHints::Performance,
             },
             None,
         ))?;
+        let belt = wgpu::util::StagingBelt::new(16 * 1024);
+        let belt_encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Gpu belt encoder"),
+        });
         surface.configure(&device, &surface_config);
         let output = surface.get_current_texture()?;
 
         Ok(sync::Arc::new(sync::RwLock::new(Self {
             device,
             queue,
+            belt,
+            belt_encoder,
             surface,
             surface_config,
             output: Some(output),
@@ -79,6 +87,15 @@ impl<'window> Gpu<'window> {
     }
     pub fn queue(&self) -> &wgpu::Queue {
         &self.queue
+    }
+    pub fn write_buffer(
+        &mut self,
+        target: &wgpu::Buffer,
+        offset: wgpu::BufferAddress,
+        size: wgpu::BufferSize,
+    ) -> wgpu::BufferViewMut {
+        self.belt
+            .write_buffer(&mut self.belt_encoder, target, offset, size, &self.device)
     }
     pub fn surface(&self) -> &wgpu::Surface {
         &self.surface
@@ -108,8 +125,18 @@ impl<'window> Gpu<'window> {
         self.command_buffer.push(command_buffer)
     }
     pub fn submit_command_buffer(&mut self) {
+        self.belt.finish();
+        let mut swap_encoder =
+            self.device()
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("Gpu belt encoder"),
+                });
+        std::mem::swap(&mut self.belt_encoder, &mut swap_encoder);
+        self.push_command_buffer(swap_encoder.finish());
+
         self.queue.submit(self.command_buffer.drain(..));
 
+        self.belt.recall();
         if let Some(output) = self.output.take() {
             output.present();
             self.configure_surface();
